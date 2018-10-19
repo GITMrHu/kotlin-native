@@ -18,20 +18,27 @@ import org.jetbrains.kotlin.ir.IrStatement
 import org.jetbrains.kotlin.ir.builders.*
 import org.jetbrains.kotlin.ir.declarations.IrDeclarationOrigin
 import org.jetbrains.kotlin.ir.declarations.IrFile
+import org.jetbrains.kotlin.ir.declarations.IrValueDeclaration
 import org.jetbrains.kotlin.ir.declarations.IrVariable
 import org.jetbrains.kotlin.ir.expressions.*
 import org.jetbrains.kotlin.ir.expressions.impl.*
+import org.jetbrains.kotlin.ir.symbols.IrSymbol
 import org.jetbrains.kotlin.ir.symbols.IrVariableSymbol
 import org.jetbrains.kotlin.ir.types.*
 import org.jetbrains.kotlin.ir.util.*
 import org.jetbrains.kotlin.ir.visitors.*
 import org.jetbrains.kotlin.util.OperatorNameConventions
 
-/**  This lowering pass optimizes range-based for loops.
+/**  This lowering pass optimizes range-based for-loops.
  *
- *   NB! not implemented yet.
  *   Process `for (elem in array) { f(elem) }` construct first.
- *   Replace with `for (i in array.indices) { f(array.get(i)) }`.
+ *   Replace with
+ *   ```
+ *   for (i in array.indices) {
+ *      val elem = array.get(i)
+ *      f(elem)
+ *   }
+ *   ```.
  *
  *   Next replace iteration over ranges (X.indices, a..b, etc.) with
  *   simple while loop over primitive induction variable.
@@ -40,13 +47,16 @@ internal class ForLoopsLowering(val context: Context) : FileLoweringPass {
 
     private val progressionInfoBuilder = ProgressionInfoBuilder(context)
 
+    // TODO: reduce scope to IrBlock(origin=FOR_LOOP)
     override fun lower(irFile: IrFile) {
-        val transformer = ForLoopsTransformer(context, progressionInfoBuilder)
+//        irFile.transformChildrenVoid(forLoopTransformer)
+
+        val transformer = RangeLoopTransformer(context, progressionInfoBuilder)
         // Lower loops
         irFile.transformChildrenVoid(transformer)
 
         // Update references in break/continue.
-        irFile.transformChildrenVoid(object: IrElementTransformerVoid() {
+        irFile.transformChildrenVoid(object : IrElementTransformerVoid() {
             override fun visitBreakContinue(jump: IrBreakContinue): IrExpression {
                 transformer.oldLoopToNewLoop[jump.loop]?.let { jump.loop = it }
                 return jump
@@ -56,12 +66,20 @@ internal class ForLoopsLowering(val context: Context) : FileLoweringPass {
 }
 
 /** Contains information about variables used in the loop. */
+
+sealed class ForLoopOrigin {
+    object Collection : ForLoopOrigin()
+    object Progression: ForLoopOrigin()
+}
+
 internal data class ForLoopInfo(
+        val origin: ForLoopOrigin = ForLoopOrigin.Progression,
         val progressionInfo: ProgressionInfo,
         val inductionVariable: IrVariable,
         val bound: IrVariable,
         val last: IrVariable,
         val step: IrVariable,
+        val collection: IrValueDeclaration? = null,
         var loopVariable: IrVariable? = null)
 
 private fun ProgressionType.elementType(context: Context): IrType = when (this) {
@@ -70,76 +88,174 @@ private fun ProgressionType.elementType(context: Context): IrType = when (this) 
     ProgressionType.CHAR_PROGRESSION -> context.irBuiltIns.charType
 }
 
-private class ForLoopsTransformer(val context: Context, val progressionInfoBuilder: ProgressionInfoBuilder) : IrElementTransformerVoidWithContext() {
+private class RangeLoopTransformer(val context: Context, val progressionInfoBuilder: ProgressionInfoBuilder) : IrElementTransformerVoidWithContext() {
 
     private val symbols = context.ir.symbols
+    // TODO: map variable itself, not symbol.
     private val iteratorToLoopInfo = mutableMapOf<IrVariableSymbol, ForLoopInfo>()
     internal val oldLoopToNewLoop = mutableMapOf<IrLoop, IrLoop>()
 
-    private val progressionElementClasses =
-            (symbols.integerClasses + symbols.char).toSet()
+    fun scopeOwnerSymbol() =
+            currentScope!!.scope.scopeOwnerSymbol
 
-    private val scopeOwnerSymbol
-        get() = currentScope!!.scope.scopeOwnerSymbol
+    private fun DeclarationIrBuilder.buildMinValueCondition(forLoopInfo: ForLoopInfo): IrExpression {
+        // Condition for a corner case: for (i in a until Int.MIN_VALUE) {}.
+        // Check if forLoopInfo.bound > MIN_VALUE.
+        val progressionType = forLoopInfo.progressionInfo.progressionType
+        val irBuiltIns = context.irBuiltIns
+        val minConst = when (progressionType) {
+            ProgressionType.INT_PROGRESSION -> IrConstImpl
+                    .int(startOffset, endOffset, irBuiltIns.intType, Int.MIN_VALUE)
+            ProgressionType.CHAR_PROGRESSION -> IrConstImpl
+                    .char(startOffset, endOffset, irBuiltIns.charType, 0.toChar())
+            ProgressionType.LONG_PROGRESSION -> IrConstImpl
+                    .long(startOffset, endOffset, irBuiltIns.longType, Long.MIN_VALUE)
+        }
+        val compareTo = symbols.getBinaryOperator(OperatorNameConventions.COMPARE_TO,
+                forLoopInfo.bound.type.toKotlinType(),
+                minConst.type.toKotlinType())
+        return irCall(irBuiltIns.greaterFunByOperandType[irBuiltIns.int]?.symbol!!).apply {
+            val compareToCall = irCall(compareTo).apply {
+                dispatchReceiver = irGet(forLoopInfo.bound)
+                putValueArgument(0, minConst)
+            }
+            putValueArgument(0, compareToCall)
+            putValueArgument(1, irInt(0))
+        }
+    }
 
-    //region Util methods ==============================================================================================
-    private fun IrExpression.castIfNecessary(progressionType: ProgressionType): IrExpression {
-        assert(type.classifierOrNull in progressionElementClasses)
-        return if (type.classifierOrNull == progressionType.elementType(context).classifierOrNull) {
-            this
+    // TODO: Eliminate the loop if we can prove that it will not be executed.
+    private fun DeclarationIrBuilder.buildEmptinessCheck(loop: IrLoop, forLoopInfo: ForLoopInfo): IrExpression {
+        val builtIns = context.irBuiltIns
+        val increasing = forLoopInfo.progressionInfo.increasing
+        val comparingBuiltIn = if (increasing) builtIns.lessOrEqualFunByOperandType[builtIns.int]?.symbol
+        else builtIns.greaterOrEqualFunByOperandType[builtIns.int]?.symbol
+
+        // Check if inductionVariable <= last.
+        val compareTo = symbols.getBinaryOperator(OperatorNameConventions.COMPARE_TO,
+                forLoopInfo.inductionVariable.type.toKotlinType(),
+                forLoopInfo.last.type.toKotlinType())
+
+        val check = irCall(comparingBuiltIn!!).apply {
+            putValueArgument(0, irCallOp(compareTo.owner, irGet(forLoopInfo.inductionVariable), irGet(forLoopInfo.last)))
+            putValueArgument(1, irInt(0))
+        }
+
+        // Process closed and open ranges in different manners.
+        return if (forLoopInfo.progressionInfo.closed) {
+            irIfThen(check, loop)   // if (inductionVariable <= last) { loop }
         } else {
-            val function = symbols.getFunction(progressionType.numberCastFunctionName, type.toKotlinType())
-            IrCallImpl(startOffset, endOffset, function.owner.returnType, function)
-                    .apply { dispatchReceiver = this@castIfNecessary }
+            // Take into account a corner case: for (i in a until Int.MIN_VALUE) {}.
+            // if (inductionVariable <= last && bound > MIN_VALUE) { loop }
+            irIfThen(check, irIfThen(buildMinValueCondition(forLoopInfo), loop))
         }
     }
 
-    private fun DeclarationIrBuilder.ensureNotNullable(expression: IrExpression): IrExpression {
-        return if (expression.type.isSimpleTypeWithQuestionMark) {
-            irImplicitCast(expression, expression.type.makeNotNull())
-        } else {
-            expression
+    private fun DeclarationIrBuilder.buildNewCondition(oldCondition: IrExpression): Pair<IrExpression, ForLoopInfo>? {
+        if (oldCondition !is IrCall || oldCondition.origin != IrStatementOrigin.FOR_LOOP_HAS_NEXT) {
+            return null
+        }
+
+        val irIteratorAccess = oldCondition.dispatchReceiver as? IrGetValue ?: throw AssertionError()
+        // Return null if we didn't lower a corresponding header.
+        val forLoopInfo = iteratorToLoopInfo[irIteratorAccess.symbol] ?: return null
+        assert(forLoopInfo.loopVariable != null)
+
+        val condition = irCall(context.irBuiltIns.booleanNotSymbol).apply {
+            putValueArgument(0, irCall(context.irBuiltIns.eqeqSymbol).apply {
+                putValueArgument(0, irGet(forLoopInfo.loopVariable!!))
+                putValueArgument(1, irGet(forLoopInfo.last))
+            })
+        }
+        return condition to forLoopInfo
+    }
+
+//    override fun visitBlock(block: IrBlock): IrExpression {
+//        if (block.origin != IrStatementOrigin.FOR_LOOP) {
+//            return block
+//        }
+//    }
+
+    /**
+     * This loop
+     *
+     * for (i in first..last step foo) { ... }
+     *
+     * is represented in IR in such a manner:
+     *
+     * val it = (first..last step foo).iterator()
+     * while (it.hasNext()) {
+     *     val i = it.next()
+     *     ...
+     * }
+     *
+     * We transform it into the following loop:
+     *
+     * var it = first
+     * if (it <= last) {  // (it >= last if the progression is decreasing)
+     *     do {
+     *         val i = it++
+     *         ...
+     *     } while (i != last)
+     * }
+     */
+    // TODO:  Lower `for (i in a until b)` to loop with precondition: for (i = a; i < b; a++);
+    override fun visitWhileLoop(loop: IrWhileLoop): IrExpression {
+        if (loop.origin != IrStatementOrigin.FOR_LOOP_INNER_WHILE) {
+            return super.visitWhileLoop(loop)
+        }
+
+        with(context.createIrBuilder(scopeOwnerSymbol(), loop.startOffset, loop.endOffset)) {
+            // Transform accesses to the old iterator (see visitVariable method). Store loopVariable in loopInfo.
+            // Replace not transparent containers with transparent ones (IrComposite)
+            val newBody = loop.body?.transform(this@RangeLoopTransformer, null)?.let {
+                if (it is IrContainerExpression && !it.isTransparentScope) {
+                    IrCompositeImpl(startOffset, endOffset, it.type, it.origin, it.statements)
+                } else {
+                    it
+                }
+            }
+            val (newCondition, forLoopInfo) = buildNewCondition(loop.condition)
+                    ?: return super.visitWhileLoop(loop)
+
+            val newLoop = IrDoWhileLoopImpl(loop.startOffset, loop.endOffset, loop.type, loop.origin).apply {
+                label = loop.label
+                condition = newCondition
+                body = newBody
+            }
+            oldLoopToNewLoop[loop] = newLoop
+            // Build a check for an empty progression before the loop.
+            return buildEmptinessCheck(newLoop, forLoopInfo)
         }
     }
 
-    private fun IrExpression.unaryMinus(): IrExpression {
-        val unaryOperator = symbols.getUnaryOperator(OperatorNameConventions.UNARY_MINUS, type.toKotlinType())
-        return IrCallImpl(startOffset, endOffset, unaryOperator.owner.returnType, unaryOperator).apply {
-            dispatchReceiver = this@unaryMinus
+    override fun visitVariable(declaration: IrVariable): IrStatement {
+        val initializer = declaration.initializer
+        if (initializer == null || initializer !is IrCall) {
+            return super.visitVariable(declaration)
         }
+        return when (initializer.origin) {
+            IrStatementOrigin.FOR_LOOP_ITERATOR ->
+                HeaderProcessor(context, progressionInfoBuilder, iteratorToLoopInfo, this::scopeOwnerSymbol).processHeader(declaration)
+            IrStatementOrigin.FOR_LOOP_NEXT ->
+                LoopBodyProcessor(context, iteratorToLoopInfo, this::scopeOwnerSymbol).processNext(declaration)
+            else -> null
+        } ?: super.visitVariable(declaration)
     }
+}
 
-    private fun ProgressionInfo.defaultStep(startOffset: Int, endOffset: Int): IrExpression {
-        val type = progressionType.elementType(context)
-        val step = if (increasing) 1 else -1
-        return when {
-            type.isInt() || type.isChar() ->
-                IrConstImpl.int(startOffset, endOffset, context.irBuiltIns.intType, step)
-            type.isLong() ->
-                IrConstImpl.long(startOffset, endOffset, context.irBuiltIns.longType, step.toLong())
-            else -> throw IllegalArgumentException()
-        }
-    }
+internal class HeaderProcessor(
+        val context: Context,
+        val progressionInfoBuilder: ProgressionInfoBuilder,
+        val iteratorToLoopInfo: MutableMap<IrVariableSymbol, ForLoopInfo>,
+        val currentScopeGetter: () -> IrSymbol) {
 
-    private fun irGetProgressionLast(progressionType: ProgressionType,
-                                     first: IrVariable,
-                                     lastExpression: IrExpression,
-                                     step: IrVariable): IrExpression {
-        val symbol = symbols.getProgressionLast[progressionType.elementType(context).toKotlinType()]
-                ?: throw IllegalArgumentException("No `getProgressionLast` for type ${step.type} ${lastExpression.type}")
-        val startOffset = lastExpression.startOffset
-        val endOffset = lastExpression.endOffset
-        return IrCallImpl(startOffset, lastExpression.endOffset, symbol.owner.returnType, symbol).apply {
-            putValueArgument(0, IrGetValueImpl(startOffset, endOffset, first.type, first.symbol))
-            putValueArgument(1, lastExpression.castIfNecessary(progressionType))
-            putValueArgument(2, IrGetValueImpl(startOffset, endOffset, step.type, step.symbol))
-        }
-    }
-    //endregion
+    private val symbols = context.ir.symbols
 
-    //region Lowering ==================================================================================================
-    // Lower a loop header.
-    private fun processHeader(variable: IrVariable, initializer: IrCall): IrStatement? {
+    private val progressionElementClasses = (symbols.integerClasses + symbols.char).toSet()
+
+    fun processHeader(variable: IrVariable): IrStatement? {
+
         assert(variable.origin == IrDeclarationOrigin.FOR_LOOP_ITERATOR)
         val symbol = variable.symbol
         val iteratorType = symbols.iterator.typeWithStarProjections
@@ -149,17 +265,20 @@ private class ForLoopsTransformer(val context: Context, val progressionInfoBuild
         }
         assert(symbol !in iteratorToLoopInfo)
 
-        val builder = context.createIrBuilder(scopeOwnerSymbol, variable.startOffset, variable.endOffset)
+        val builder = context.createIrBuilder(currentScopeGetter(), variable.startOffset, variable.endOffset)
         // Collect loop info and form the loop header composite.
-        val progressionInfo = initializer.dispatchReceiver?.accept(progressionInfoBuilder, null)
+        val progressionInfo = variable.accept(progressionInfoBuilder, null)
                 ?: return null
 
         with(builder) {
-            with(progressionInfo) {
+            kotlin.with(progressionInfo) {
                 // Due to features of PSI2IR we can obtain nullable arguments here while actually
                 // they are non-nullable (the frontend takes care about this). So we need to cast them to non-nullable.
                 val statements = mutableListOf<IrStatement>()
-
+                progressionInfo.collectionReference?.let {
+                    it.parent = variable.parent
+                    statements += it
+                }
                 /**
                  * For this loop:
                  * `for (i in a() .. b() step c() step d())`
@@ -217,36 +336,129 @@ private class ForLoopsTransformer(val context: Context, val progressionInfoBuild
                     statements.add(it)
                 }
 
-                iteratorToLoopInfo[symbol] = ForLoopInfo(progressionInfo,
+                val (collection, forLoopOrigin) = if (collectionReference != null) {
+                    collectionReference to ForLoopOrigin.Collection
+                } else {
+                    null to ForLoopOrigin.Progression
+                }
+
+                iteratorToLoopInfo[symbol] = ForLoopInfo(
+                        forLoopOrigin,
+                        progressionInfo,
                         inductionVariable,
                         boundValue,
                         lastValue,
-                        stepValue)
+                        stepValue,
+                        collection=collection)
 
                 return IrCompositeImpl(startOffset, endOffset, context.irBuiltIns.unitType, null, statements)
             }
         }
     }
 
+    private fun IrExpression.castIfNecessary(progressionType: ProgressionType): IrExpression {
+        assert(type.classifierOrNull in progressionElementClasses)
+        return if (type.classifierOrNull == progressionType.elementType(context).classifierOrNull) {
+            this
+        } else {
+            val function = symbols.getFunction(progressionType.numberCastFunctionName, type.toKotlinType())
+            IrCallImpl(startOffset, endOffset, function.owner.returnType, function)
+                    .apply { dispatchReceiver = this@castIfNecessary }
+        }
+    }
+
+    private fun DeclarationIrBuilder.ensureNotNullable(expression: IrExpression): IrExpression {
+        return if (expression.type.isSimpleTypeWithQuestionMark) {
+            irImplicitCast(expression, expression.type.makeNotNull())
+        } else {
+            expression
+        }
+    }
+
+    private fun IrExpression.unaryMinus(): IrExpression {
+        val unaryOperator = symbols.getUnaryOperator(OperatorNameConventions.UNARY_MINUS, type.toKotlinType())
+        return IrCallImpl(startOffset, endOffset, unaryOperator.owner.returnType, unaryOperator).apply {
+            dispatchReceiver = this@unaryMinus
+        }
+    }
+
+    private fun ProgressionInfo.defaultStep(startOffset: Int, endOffset: Int): IrExpression {
+        val type = progressionType.elementType(context)
+        val step = if (increasing) 1 else -1
+        return when {
+            type.isInt() || type.isChar() ->
+                IrConstImpl.int(startOffset, endOffset, context.irBuiltIns.intType, step)
+            type.isLong() ->
+                IrConstImpl.long(startOffset, endOffset, context.irBuiltIns.longType, step.toLong())
+            else -> throw IllegalArgumentException()
+        }
+    }
+
+    private fun irGetProgressionLast(progressionType: ProgressionType,
+                                     first: IrVariable,
+                                     lastExpression: IrExpression,
+                                     step: IrVariable): IrExpression {
+        val symbol = symbols.getProgressionLast[progressionType.elementType(context).toKotlinType()]
+                ?: throw IllegalArgumentException("No `getProgressionLast` for type ${step.type} ${lastExpression.type}")
+        val startOffset = lastExpression.startOffset
+        val endOffset = lastExpression.endOffset
+        return IrCallImpl(startOffset, lastExpression.endOffset, symbol.owner.returnType, symbol).apply {
+            putValueArgument(0, IrGetValueImpl(startOffset, endOffset, first.type, first.symbol))
+            putValueArgument(1, lastExpression.castIfNecessary(progressionType))
+            putValueArgument(2, IrGetValueImpl(startOffset, endOffset, step.type, step.symbol))
+        }
+    }
+}
+
+private class LoopBodyProcessor(
+        val context: Context,
+        val iteratorToLoopInfo: MutableMap<IrVariableSymbol, ForLoopInfo>,
+        val currentScopeGetter: () -> IrSymbol) {
+
+    private val symbols = context.ir.symbols
+
+    private fun getIterator(initializer: IrCall): IrGetValue =
+            if (initializer.symbol in symbols.arraysGets.values) {
+                (initializer.getValueArgument(0) as? IrCall)?.dispatchReceiver
+            } else {
+                initializer.dispatchReceiver
+            } as? IrGetValue ?: throw AssertionError()
+
     // Lower getting a next induction variable value.
-    private fun processNext(variable: IrVariable, initializer: IrCall): IrExpression? {
-        assert(variable.origin == IrDeclarationOrigin.FOR_LOOP_VARIABLE
-                || variable.origin == IrDeclarationOrigin.FOR_LOOP_IMPLICIT_VARIABLE)
-        val irIteratorAccess = initializer.dispatchReceiver as? IrGetValue ?: throw AssertionError()
-        val forLoopInfo = iteratorToLoopInfo[irIteratorAccess.symbol] ?: return null  // If we didn't lower a corresponding header.
-        val builder = context.createIrBuilder(scopeOwnerSymbol, initializer.startOffset, initializer.endOffset)
+    fun processNext(variable: IrVariable): IrExpression? {
+        val initializer = variable.initializer as IrCall
+
+        val iterator = getIterator(initializer)
+        val forLoopInfo = iteratorToLoopInfo[iterator.symbol]
+                ?: return null  // If we didn't lower a corresponding header.
 
         val plusOperator = symbols.getBinaryOperator(
                 OperatorNameConventions.PLUS,
                 forLoopInfo.inductionVariable.type.toKotlinType(),
                 forLoopInfo.step.type.toKotlinType()
         )
-        forLoopInfo.loopVariable = variable
 
-        with(builder) {
-            variable.initializer = irGet(forLoopInfo.inductionVariable)
-            val increment = irSetVar(forLoopInfo.inductionVariable,
-                    irCallOp(plusOperator.owner, irGet(forLoopInfo.inductionVariable), irGet(forLoopInfo.step)))
+        forLoopInfo.loopVariable = when (forLoopInfo.origin) {
+            ForLoopOrigin.Collection -> forLoopInfo.inductionVariable
+            ForLoopOrigin.Progression -> variable
+        }
+
+
+        with(context.createIrBuilder(currentScopeGetter(), initializer.startOffset, initializer.endOffset)) {
+            when (forLoopInfo.origin) {
+                ForLoopOrigin.Collection -> {
+                    val collectionDeclaration: IrValueDeclaration = forLoopInfo.collection!!
+                    val callee = symbols.arraysGets[collectionDeclaration.type.classifierOrFail]!!
+                    variable.initializer = irCall(callee).apply {
+                        dispatchReceiver = irGet(collectionDeclaration)
+                        putValueArgument(0, irGet(forLoopInfo.inductionVariable))
+                    }
+                }
+                else -> variable.initializer = irGet(forLoopInfo.inductionVariable)
+            }
+            val increment = irSetVar(forLoopInfo.inductionVariable, irCallOp(plusOperator.owner,
+                    irGet(forLoopInfo.inductionVariable),
+                    irGet(forLoopInfo.step)))
             return IrCompositeImpl(variable.startOffset,
                     variable.endOffset,
                     context.irBuiltIns.unitType,
@@ -254,142 +466,4 @@ private class ForLoopsTransformer(val context: Context, val progressionInfoBuild
                     listOf(variable, increment))
         }
     }
-
-    private fun DeclarationIrBuilder.buildMinValueCondition(forLoopInfo: ForLoopInfo): IrExpression {
-        // Condition for a corner case: for (i in a until Int.MIN_VALUE) {}.
-        // Check if forLoopInfo.bound > MIN_VALUE.
-        val progressionType = forLoopInfo.progressionInfo.progressionType
-        val irBuiltIns = context.irBuiltIns
-        val minConst = when (progressionType) {
-            ProgressionType.INT_PROGRESSION -> IrConstImpl
-                    .int(startOffset, endOffset, irBuiltIns.intType, Int.MIN_VALUE)
-            ProgressionType.CHAR_PROGRESSION -> IrConstImpl
-                    .char(startOffset, endOffset, irBuiltIns.charType, 0.toChar())
-            ProgressionType.LONG_PROGRESSION -> IrConstImpl
-                    .long(startOffset, endOffset, irBuiltIns.longType, Long.MIN_VALUE)
-        }
-        val compareTo = symbols.getBinaryOperator(OperatorNameConventions.COMPARE_TO,
-                forLoopInfo.bound.type.toKotlinType(),
-                minConst.type.toKotlinType())
-        return irCall(irBuiltIns.greaterFunByOperandType[irBuiltIns.int]?.symbol!!).apply {
-            val compareToCall = irCall(compareTo).apply {
-                dispatchReceiver = irGet(forLoopInfo.bound)
-                putValueArgument(0, minConst)
-            }
-            putValueArgument(0, compareToCall)
-            putValueArgument(1, irInt(0))
-        }
-    }
-
-    // TODO: Eliminate the loop if we can prove that it will not be executed.
-    private fun DeclarationIrBuilder.buildEmptinessCheck(loop: IrLoop, forLoopInfo: ForLoopInfo): IrExpression {
-        val builtIns = context.irBuiltIns
-        val increasing = forLoopInfo.progressionInfo.increasing
-        val comparingBuiltIn = if (increasing) builtIns.lessOrEqualFunByOperandType[builtIns.int]?.symbol
-        else builtIns.greaterOrEqualFunByOperandType[builtIns.int]?.symbol
-
-        // Check if inductionVariable <= last.
-        val compareTo = symbols.getBinaryOperator(OperatorNameConventions.COMPARE_TO,
-                forLoopInfo.inductionVariable.type.toKotlinType(),
-                forLoopInfo.last.type.toKotlinType())
-
-        val check: IrExpression = irCall(comparingBuiltIn!!).apply {
-            putValueArgument(0, irCallOp(compareTo.owner, irGet(forLoopInfo.inductionVariable), irGet(forLoopInfo.last)))
-            putValueArgument(1, irInt(0))
-        }
-
-        // Process closed and open ranges in different manners.
-        return if (forLoopInfo.progressionInfo.closed) {
-            irIfThen(check, loop)   // if (inductionVariable <= last) { loop }
-        } else {
-            // Take into account a corner case: for (i in a until Int.MIN_VALUE) {}.
-            // if (inductionVariable <= last && bound > MIN_VALUE) { loop }
-            irIfThen(check, irIfThen(buildMinValueCondition(forLoopInfo), loop))
-        }
-    }
-
-    private fun DeclarationIrBuilder.buildNewCondition(oldCondition: IrExpression): Pair<IrExpression, ForLoopInfo>? {
-        if (oldCondition !is IrCall || oldCondition.origin != IrStatementOrigin.FOR_LOOP_HAS_NEXT) {
-            return null
-        }
-
-        val irIteratorAccess = oldCondition.dispatchReceiver as? IrGetValue ?: throw AssertionError()
-        // Return null if we didn't lower a corresponding header.
-        val forLoopInfo = iteratorToLoopInfo[irIteratorAccess.symbol] ?: return null
-        assert(forLoopInfo.loopVariable != null)
-
-        return irCall(context.irBuiltIns.booleanNotSymbol).apply {
-            val eqeqCall = irCall(context.irBuiltIns.eqeqSymbol).apply {
-                putValueArgument(0, irGet(forLoopInfo.loopVariable!!))
-                putValueArgument(1, irGet(forLoopInfo.last))
-            }
-            putValueArgument(0, eqeqCall)
-        } to forLoopInfo
-    }
-
-    /**
-     * This loop
-     *
-     * for (i in first..last step foo) { ... }
-     *
-     * is represented in IR in such a manner:
-     *
-     * val it = (first..last step foo).iterator()
-     * while (it.hasNext()) {
-     *     val i = it.next()
-     *     ...
-     * }
-     *
-     * We transform it into the following loop:
-     *
-     * var it = first
-     * if (it <= last) {  // (it >= last if the progression is decreasing)
-     *     do {
-     *         val i = it++
-     *         ...
-     *     } while (i != last)
-     * }
-     */
-    // TODO:  Lower `for (i in a until b)` to loop with precondition: for (i = a; i < b; a++);
-    override fun visitWhileLoop(loop: IrWhileLoop): IrExpression {
-        if (loop.origin != IrStatementOrigin.FOR_LOOP_INNER_WHILE) {
-            return super.visitWhileLoop(loop)
-        }
-
-        with(context.createIrBuilder(scopeOwnerSymbol, loop.startOffset, loop.endOffset)) {
-            // Transform accesses to the old iterator (see visitVariable method). Store loopVariable in loopInfo.
-            // Replace not transparent containers with transparent ones (IrComposite)
-            val newBody = loop.body?.transform(this@ForLoopsTransformer, null)?.let {
-                if (it is IrContainerExpression && !it.isTransparentScope) {
-                    IrCompositeImpl(startOffset, endOffset, it.type, it.origin, it.statements)
-                } else {
-                    it
-                }
-            }
-            val (newCondition, forLoopInfo) = buildNewCondition(loop.condition) ?: return super.visitWhileLoop(loop)
-
-            val newLoop = IrDoWhileLoopImpl(loop.startOffset, loop.endOffset, loop.type, loop.origin).apply {
-                label = loop.label
-                condition = newCondition
-                body = newBody
-            }
-            oldLoopToNewLoop[loop] = newLoop
-            // Build a check for an empty progression before the loop.
-            return buildEmptinessCheck(newLoop, forLoopInfo)
-        }
-    }
-
-    override fun visitVariable(declaration: IrVariable): IrStatement {
-        val initializer = declaration.initializer
-        if (initializer == null || initializer !is IrCall) {
-            return super.visitVariable(declaration)
-        }
-        val result = when (initializer.origin) {
-            IrStatementOrigin.FOR_LOOP_ITERATOR -> processHeader(declaration, initializer)
-            IrStatementOrigin.FOR_LOOP_NEXT -> processNext(declaration, initializer)
-            else -> null
-        }
-        return result ?: super.visitVariable(declaration)
-    }
-    //endregion
 }

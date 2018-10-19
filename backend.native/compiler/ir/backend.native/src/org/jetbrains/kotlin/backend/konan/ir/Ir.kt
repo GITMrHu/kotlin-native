@@ -306,7 +306,6 @@ internal class KonanSymbols(context: Context, val symbolTable: SymbolTable, val 
                 } ?: error(descriptor.toString())
         return symbolTable.referenceSimpleFunction(functionDescriptor)
     }
-
     override val copyRangeTo = arrays.map { symbol ->
         val packageViewDescriptor = builtIns.builtInsModule.getPackage(KotlinBuiltIns.COLLECTIONS_PACKAGE_FQ_NAME)
         val functionDescriptor = packageViewDescriptor.memberScope
@@ -325,14 +324,20 @@ internal class KonanSymbols(context: Context, val symbolTable: SymbolTable, val 
             .getContributedFunctions(Name.identifier("set"), NoLookupLocation.FROM_BACKEND)
             .single().let { symbolTable.referenceSimpleFunction(it) }
 
+    // TODO: Unify with [arrayGet]
+    val arraysGets = arrays.associateBy(
+            { it },
+            { it.descriptor.unsubstitutedMemberScope
+                    .getContributedFunctions(Name.identifier("get"), NoLookupLocation.FROM_BACKEND)
+                    .single().let { symbolTable.referenceSimpleFunction(it) } }
+    )
+
     val arraySize = arrays.associateBy(
             { it },
             { it.descriptor.unsubstitutedMemberScope
                     .getContributedVariables(Name.identifier("size"), NoLookupLocation.FROM_BACKEND)
                     .single().let { symbolTable.referenceSimpleFunction(it.getter!!) } }
     )
-
-
 
     val valuesForEnum = symbolTable.referenceSimpleFunction(
             context.getInternalFunctions("valuesForEnum").single())

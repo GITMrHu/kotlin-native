@@ -74,14 +74,14 @@ abstract class KonanTest extends JavaExec {
 
     KonanTest() {
         // We don't build the compiler if a custom dist path is specified.
-        if (!project.ext.useCustomDist) {
-            dependsOn(project.rootProject.tasks['dist'])
-            if (project.testTarget) {
-                // if a test_target property is set then tests should depend on a crossDist
-                // otherwise runtime components would not be build for a target
-                dependsOn(project.rootProject.tasks["${target}CrossDist"])
-            }
-        }
+//        if (!project.ext.useCustomDist) {
+//            dependsOn(project.rootProject.tasks['dist'])
+//            if (project.testTarget) {
+//                // if a test_target property is set then tests should depend on a crossDist
+//                // otherwise runtime components would not be build for a target
+//                dependsOn(project.rootProject.tasks["${target}CrossDist"])
+//            }
+//        }
     }
 
     @Override
@@ -508,7 +508,7 @@ class RunStandaloneKonanTest extends KonanTest {
     public def inDevelopersRun = true
 
     void compileTest(List<String> filesToCompile, String exe) {
-        runCompiler(filesToCompile, exe, flags?:[])
+        runCompiler(filesToCompile, exe, flags ?: ['-opt'])
     }
 }
 
