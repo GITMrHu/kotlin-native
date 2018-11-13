@@ -73,6 +73,7 @@ internal class ProgressionInfoBuilder(val context: Context) : IrElementVisitor<P
         val progressionType = expression.type.getProgressionType()
                 // Try to handle call with collection handler
                 ?: return collectionIterationHandler.handle(expression, ProgressionType.INT_PROGRESSION)
+                        ?: return expression.dispatchReceiver?.accept(this, null)
 
         return progressionHandlers.firstNotNullResult { it.handle(expression, progressionType) }
     }

@@ -170,12 +170,6 @@ private class RangeLoopTransformer(val context: Context, val progressionInfoBuil
         return condition to forLoopInfo
     }
 
-//    override fun visitBlock(block: IrBlock): IrExpression {
-//        if (block.origin != IrStatementOrigin.FOR_LOOP) {
-//            return block
-//        }
-//    }
-
     /**
      * This loop
      *
@@ -275,9 +269,9 @@ internal class HeaderProcessor(
                 // Due to features of PSI2IR we can obtain nullable arguments here while actually
                 // they are non-nullable (the frontend takes care about this). So we need to cast them to non-nullable.
                 val statements = mutableListOf<IrStatement>()
-                progressionInfo.collectionReference?.let {
-                    it.parent = variable.parent
-                    statements += it
+                progressionInfo.collectionReference?.let { collection ->
+                    collection.parent = variable.parent
+                    statements += collection
                 }
                 /**
                  * For this loop:

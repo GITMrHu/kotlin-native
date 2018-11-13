@@ -174,6 +174,7 @@ internal class CollectionIterationHandler(val context: Context) : ProgressionHan
                 collectionProducer.endOffset,
                 IrDeclarationOrigin.IR_TEMPORARY_VARIABLE,
                 IrVariableSymbolImpl(wrappedVariableDescriptor),
+                // TODO: better identifier
                 Name.identifier("TODO()_collection"),
                 collectionProducer.dispatchReceiver!!.type,
                 false,
@@ -186,9 +187,11 @@ internal class CollectionIterationHandler(val context: Context) : ProgressionHan
 
     override fun build(call: IrCall, progressionType: ProgressionType): ProgressionInfo? {
 
-        if (!context.shouldOptimize()) {
-            return null
-        }
+//        // TODO: enable
+//        if (!context.shouldOptimize()) {
+//            return null
+//        }
+        // TODO: create only if there is need for separate reference.
         val collectionReference = createCollectionReference(call)
                 ?: return null
 
