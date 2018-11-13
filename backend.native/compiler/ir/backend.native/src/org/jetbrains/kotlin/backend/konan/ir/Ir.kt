@@ -325,14 +325,14 @@ internal class KonanSymbols(context: Context, val symbolTable: SymbolTable, val 
             .single().let { symbolTable.referenceSimpleFunction(it) }
 
     // TODO: Unify with [arrayGet]
-    val arraysGets = arrays.associateBy(
+    val arraysGets = (arrays + arrayList).associateBy(
             { it },
             { it.descriptor.unsubstitutedMemberScope
                     .getContributedFunctions(Name.identifier("get"), NoLookupLocation.FROM_BACKEND)
                     .single().let { symbolTable.referenceSimpleFunction(it) } }
     )
 
-    val arraySize = arrays.associateBy(
+    val arraySize = (arrays + arrayList).associateBy(
             { it },
             { it.descriptor.unsubstitutedMemberScope
                     .getContributedVariables(Name.identifier("size"), NoLookupLocation.FROM_BACKEND)

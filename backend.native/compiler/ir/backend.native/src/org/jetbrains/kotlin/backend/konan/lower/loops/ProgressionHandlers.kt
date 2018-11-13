@@ -158,7 +158,7 @@ internal class CollectionIterationHandler(val context: Context) : ProgressionHan
 
     private val symbols = context.ir.symbols
 
-    private val supportedArrays = symbols.primitiveArrays.values + symbols.array + symbols.string
+    private val supportedArrays = symbols.primitiveArrays.values + symbols.array + symbols.string + symbols.arrayList
 
     override val matcher = createIrCallMatcher {
         origin { it == IrStatementOrigin.FOR_LOOP_ITERATOR }
