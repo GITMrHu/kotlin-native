@@ -154,7 +154,7 @@ internal class StepHandler(context: Context, val visitor: IrElementVisitor<Progr
 
 
 
-internal class CollectionIterationHandler(val context: Context) : ProgressionHandler {
+internal class ArrayIterationHandler(val context: Context) : ProgressionHandler {
 
     private val symbols = context.ir.symbols
 
@@ -165,10 +165,12 @@ internal class CollectionIterationHandler(val context: Context) : ProgressionHan
         dispatchReceiver { it != null && it.type.classifierOrNull in supportedArrays }
     }
 
-    private fun createCollectionReference(collectionProducer: IrCall): IrValueDeclaration {
-
+    // Consider case like
+    // `for (elem in getArray()) { ... }`
+    // TODO: complete comment
+    //
+    private fun createArrayReference(collectionProducer: IrCall): IrValueDeclaration {
         val wrappedVariableDescriptor = WrappedVariableDescriptor()
-
         return IrVariableImpl(
                 collectionProducer.startOffset,
                 collectionProducer.endOffset,
@@ -187,13 +189,12 @@ internal class CollectionIterationHandler(val context: Context) : ProgressionHan
 
     override fun build(call: IrCall, progressionType: ProgressionType): ProgressionInfo? {
         // TODO: create only if there is need for separate reference.
-        val collectionReference = createCollectionReference(call)
-
+        val collectionReference = createArrayReference(call)
         val int0 = IrConstImpl.int(call.startOffset, call.endOffset, context.irBuiltIns.intType, 0)
         val bound = with(context.createIrBuilder(call.symbol, call.startOffset, call.endOffset)) {
             val clazz = collectionReference.type.classifierOrFail
-            val symbol = symbols.arraySize[clazz]!!
-            irCall(symbol).apply {
+            val arraySizeSymbol = symbols.arraySize[clazz]!!
+            irCall(arraySizeSymbol).apply {
                 dispatchReceiver = irGet(collectionReference)
             }
         }

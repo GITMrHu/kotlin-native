@@ -45,6 +45,7 @@ internal class ProgressionInfoBuilder(val context: Context) : IrElementVisitor<P
 
     private val symbols = context.ir.symbols
 
+    // TODO: Consider unsigned types as well.
     private val progressionElementClasses = symbols.integerClasses + symbols.char
 
     private val progressionHandlers = listOf(
@@ -55,7 +56,7 @@ internal class ProgressionInfoBuilder(val context: Context) : IrElementVisitor<P
             RangeToHandler(progressionElementClasses)
     )
 
-    private val collectionIterationHandler = CollectionIterationHandler(context)
+    private val arrayIterationHandler = ArrayIterationHandler(context)
 
     private fun IrType.getProgressionType(): ProgressionType? = when {
         isSubtypeOf(symbols.charProgression.owner.defaultType) -> ProgressionType.CHAR_PROGRESSION
@@ -71,10 +72,13 @@ internal class ProgressionInfoBuilder(val context: Context) : IrElementVisitor<P
 
     override fun visitCall(expression: IrCall, data: Nothing?): ProgressionInfo? {
         val progressionType = expression.type.getProgressionType()
-                // Try to handle call with collection handler
-                ?: return collectionIterationHandler.handle(expression, ProgressionType.INT_PROGRESSION)
-                        ?: return expression.dispatchReceiver?.accept(this, null)
 
-        return progressionHandlers.firstNotNullResult { it.handle(expression, progressionType) }
+        // TODO: Simplify or document
+        return if (progressionType != null) {
+            progressionHandlers.firstNotNullResult { it.handle(expression, progressionType) }
+        } else {
+            arrayIterationHandler.handle(expression, ProgressionType.INT_PROGRESSION)
+                    ?: expression.dispatchReceiver?.accept(this, null)
+        }
     }
 }

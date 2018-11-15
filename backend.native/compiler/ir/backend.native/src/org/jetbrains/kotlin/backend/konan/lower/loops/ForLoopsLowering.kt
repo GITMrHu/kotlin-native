@@ -139,7 +139,13 @@ private class RangeLoopTransformer(val context: Context, val progressionInfoBuil
     private fun DeclarationIrBuilder.buildEmptinessCheck(loop: IrLoop, forLoopInfo: ForLoopInfo): IrExpression {
         val builtIns = context.irBuiltIns
         val increasing = forLoopInfo.progressionInfo.increasing
-        val comparingBuiltIn = if (increasing) builtIns.lessOrEqualFunByOperandType[builtIns.int]?.symbol
+        val comparingBuiltIn = if (increasing) {
+            // TODO: Consider behavior unification?
+            when (forLoopInfo) {
+                is ProgressionLoopInfo -> builtIns.lessOrEqualFunByOperandType[builtIns.int]?.symbol
+                is CollectionLoopInfo -> builtIns.lessFunByOperandType[builtIns.int]?.symbol
+            }
+        }
         else builtIns.greaterOrEqualFunByOperandType[builtIns.int]?.symbol
 
         // Check if inductionVariable <= last.
@@ -254,19 +260,22 @@ private class RangeLoopTransformer(val context: Context, val progressionInfoBuil
 
         with(builder) {
             kotlin.with(progressionInfo) {
-                // Due to features of PSI2IR we can obtain nullable arguments here while actually
-                // they are non-nullable (the frontend takes care about this). So we need to cast them to non-nullable.
-                val statements = mutableListOf<IrStatement>()
-                progressionInfo.collectionReference?.let { collection ->
-                    collection.parent = variable.parent
-                    statements += collection
-                }
                 /**
                  * For this loop:
                  * `for (i in a() .. b() step c() step d())`
                  * We need to call functions in the following order: a, b, c, d.
                  * So we call b() before step calculations and then call last element calculation function (if required).
                  */
+
+                val statements = mutableListOf<IrStatement>()
+
+                progressionInfo.collectionReference?.let { collection ->
+                    collection.parent = variable.parent
+                    statements += collection
+                }
+
+                // Due to features of PSI2IR we can obtain nullable arguments here while actually
+                // they are non-nullable (the frontend takes care about this). So we need to cast them to non-nullable.
                 val inductionVariable = scope.createTemporaryVariable(first.castIfNecessary(progressionType),
                         nameHint = "inductionVariable",
                         isMutable = true,
