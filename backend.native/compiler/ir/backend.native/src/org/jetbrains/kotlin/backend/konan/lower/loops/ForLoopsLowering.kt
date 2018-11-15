@@ -66,21 +66,32 @@ internal class ForLoopsLowering(val context: Context) : FileLoweringPass {
 }
 
 /** Contains information about variables used in the loop. */
+sealed class ForLoopInfo(
+    val progressionInfo: ProgressionInfo,
+    val inductionVariable: IrVariable,
+    val bound: IrVariable,
+    val last: IrVariable,
+    val step: IrVariable,
+    var loopVariable: IrVariable?
+)
 
-sealed class ForLoopOrigin {
-    object Collection : ForLoopOrigin()
-    object Progression: ForLoopOrigin()
-}
+internal class ProgressionLoopInfo(
+        progressionInfo: ProgressionInfo,
+        inductionVariable: IrVariable,
+        bound: IrVariable,
+        last: IrVariable,
+        step: IrVariable,
+        loopVariable: IrVariable? = null
+) : ForLoopInfo(progressionInfo, inductionVariable, bound, last, step, loopVariable)
 
-internal data class ForLoopInfo(
-        val origin: ForLoopOrigin = ForLoopOrigin.Progression,
-        val progressionInfo: ProgressionInfo,
-        val inductionVariable: IrVariable,
-        val bound: IrVariable,
-        val last: IrVariable,
-        val step: IrVariable,
-        val collection: IrValueDeclaration? = null,
-        var loopVariable: IrVariable? = null)
+internal class CollectionLoopInfo(
+        progressionInfo: ProgressionInfo,
+        inductionVariable: IrVariable,
+        bound: IrVariable,
+        last: IrVariable,
+        step: IrVariable,
+        val collection: IrValueDeclaration
+) : ForLoopInfo(progressionInfo, inductionVariable, bound, last, step, inductionVariable)
 
 private fun ProgressionType.elementType(context: Context): IrType = when (this) {
     ProgressionType.INT_PROGRESSION -> context.irBuiltIns.intType
@@ -223,29 +234,6 @@ private class RangeLoopTransformer(val context: Context, val progressionInfoBuil
         }
     }
 
-    override fun visitVariable(declaration: IrVariable): IrStatement {
-        val initializer = declaration.initializer
-        if (initializer == null || initializer !is IrCall) {
-            return super.visitVariable(declaration)
-        }
-        return when (initializer.origin) {
-            IrStatementOrigin.FOR_LOOP_ITERATOR ->
-                HeaderProcessor(context, progressionInfoBuilder, iteratorToLoopInfo, this::scopeOwnerSymbol).processHeader(declaration)
-            IrStatementOrigin.FOR_LOOP_NEXT ->
-                LoopBodyProcessor(context, iteratorToLoopInfo, this::scopeOwnerSymbol).processNext(declaration)
-            else -> null
-        } ?: super.visitVariable(declaration)
-    }
-}
-
-internal class HeaderProcessor(
-        val context: Context,
-        val progressionInfoBuilder: ProgressionInfoBuilder,
-        val iteratorToLoopInfo: MutableMap<IrVariableSymbol, ForLoopInfo>,
-        val currentScopeGetter: () -> IrSymbol) {
-
-    private val symbols = context.ir.symbols
-
     private val progressionElementClasses = (symbols.integerClasses + symbols.char).toSet()
 
     fun processHeader(variable: IrVariable): IrStatement? {
@@ -259,7 +247,7 @@ internal class HeaderProcessor(
         }
         assert(symbol !in iteratorToLoopInfo)
 
-        val builder = context.createIrBuilder(currentScopeGetter(), variable.startOffset, variable.endOffset)
+        val builder = context.createIrBuilder(scopeOwnerSymbol(), variable.startOffset, variable.endOffset)
         // Collect loop info and form the loop header composite.
         val progressionInfo = variable.accept(progressionInfoBuilder, null)
                 ?: return null
@@ -330,20 +318,24 @@ internal class HeaderProcessor(
                     statements.add(it)
                 }
 
-                val (collection, forLoopOrigin) = if (collectionReference != null) {
-                    collectionReference to ForLoopOrigin.Collection
+                iteratorToLoopInfo[symbol] = if (collectionReference != null) {
+                    CollectionLoopInfo(
+                            progressionInfo,
+                            inductionVariable,
+                            boundValue,
+                            lastValue,
+                            stepValue,
+                            collection = collectionReference)
                 } else {
-                    null to ForLoopOrigin.Progression
+                    ProgressionLoopInfo(
+                            progressionInfo,
+                            inductionVariable,
+                            boundValue,
+                            lastValue,
+                            stepValue
+                    )
                 }
 
-                iteratorToLoopInfo[symbol] = ForLoopInfo(
-                        forLoopOrigin,
-                        progressionInfo,
-                        inductionVariable,
-                        boundValue,
-                        lastValue,
-                        stepValue,
-                        collection=collection)
 
                 return IrCompositeImpl(startOffset, endOffset, context.irBuiltIns.unitType, null, statements)
             }
@@ -402,14 +394,6 @@ internal class HeaderProcessor(
             putValueArgument(2, IrGetValueImpl(startOffset, endOffset, step.type, step.symbol))
         }
     }
-}
-
-private class LoopBodyProcessor(
-        val context: Context,
-        val iteratorToLoopInfo: MutableMap<IrVariableSymbol, ForLoopInfo>,
-        val currentScopeGetter: () -> IrSymbol) {
-
-    private val symbols = context.ir.symbols
 
     private fun getIterator(initializer: IrCall): IrGetValue =
             if (initializer.symbol in symbols.arraysGets.values) {
@@ -432,16 +416,14 @@ private class LoopBodyProcessor(
                 forLoopInfo.step.type.toKotlinType()
         )
 
-        forLoopInfo.loopVariable = when (forLoopInfo.origin) {
-            ForLoopOrigin.Collection -> forLoopInfo.inductionVariable
-            ForLoopOrigin.Progression -> variable
+        if (forLoopInfo is ProgressionLoopInfo) {
+            forLoopInfo.loopVariable = variable
         }
 
-
-        with(context.createIrBuilder(currentScopeGetter(), initializer.startOffset, initializer.endOffset)) {
-            when (forLoopInfo.origin) {
-                ForLoopOrigin.Collection -> {
-                    val collectionDeclaration: IrValueDeclaration = forLoopInfo.collection!!
+        with(context.createIrBuilder(scopeOwnerSymbol(), initializer.startOffset, initializer.endOffset)) {
+            when (forLoopInfo) {
+                is CollectionLoopInfo -> {
+                    val collectionDeclaration: IrValueDeclaration = forLoopInfo.collection
                     val callee = symbols.arraysGets[collectionDeclaration.type.classifierOrFail]!!
                     variable.initializer = irCall(callee).apply {
                         dispatchReceiver = irGet(collectionDeclaration)
@@ -459,5 +441,19 @@ private class LoopBodyProcessor(
                     IrStatementOrigin.FOR_LOOP_NEXT,
                     listOf(variable, increment))
         }
+    }
+
+    override fun visitVariable(declaration: IrVariable): IrStatement {
+        val initializer = declaration.initializer
+        if (initializer == null || initializer !is IrCall) {
+            return super.visitVariable(declaration)
+        }
+        return when (initializer.origin) {
+            IrStatementOrigin.FOR_LOOP_ITERATOR ->
+                processHeader(declaration)
+            IrStatementOrigin.FOR_LOOP_NEXT ->
+                processNext(declaration)
+            else -> null
+        } ?: super.visitVariable(declaration)
     }
 }

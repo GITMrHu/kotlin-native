@@ -165,7 +165,7 @@ internal class CollectionIterationHandler(val context: Context) : ProgressionHan
         dispatchReceiver { it != null && it.type.classifierOrNull in supportedArrays }
     }
 
-    private fun createCollectionReference(collectionProducer: IrCall): IrValueDeclaration? {
+    private fun createCollectionReference(collectionProducer: IrCall): IrValueDeclaration {
 
         val wrappedVariableDescriptor = WrappedVariableDescriptor()
 
@@ -186,14 +186,8 @@ internal class CollectionIterationHandler(val context: Context) : ProgressionHan
     }
 
     override fun build(call: IrCall, progressionType: ProgressionType): ProgressionInfo? {
-
-//        // TODO: enable
-//        if (!context.shouldOptimize()) {
-//            return null
-//        }
         // TODO: create only if there is need for separate reference.
         val collectionReference = createCollectionReference(call)
-                ?: return null
 
         val int0 = IrConstImpl.int(call.startOffset, call.endOffset, context.irBuiltIns.intType, 0)
         val bound = with(context.createIrBuilder(call.symbol, call.startOffset, call.endOffset)) {
