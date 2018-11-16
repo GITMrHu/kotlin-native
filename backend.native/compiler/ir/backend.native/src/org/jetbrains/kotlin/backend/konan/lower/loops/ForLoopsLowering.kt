@@ -22,7 +22,6 @@ import org.jetbrains.kotlin.ir.declarations.IrValueDeclaration
 import org.jetbrains.kotlin.ir.declarations.IrVariable
 import org.jetbrains.kotlin.ir.expressions.*
 import org.jetbrains.kotlin.ir.expressions.impl.*
-import org.jetbrains.kotlin.ir.symbols.IrSymbol
 import org.jetbrains.kotlin.ir.symbols.IrVariableSymbol
 import org.jetbrains.kotlin.ir.types.*
 import org.jetbrains.kotlin.ir.util.*
@@ -31,16 +30,7 @@ import org.jetbrains.kotlin.util.OperatorNameConventions
 
 /**  This lowering pass optimizes range-based for-loops.
  *
- *   Process `for (elem in array) { f(elem) }` construct first.
- *   Replace with
- *   ```
- *   for (i in array.indices) {
- *      val elem = array.get(i)
- *      f(elem)
- *   }
- *   ```.
- *
- *   Next replace iteration over ranges (X.indices, a..b, etc.) with
+ *   Replace iteration over ranges (X.indices, a..b, etc.) and arrays with
  *   simple while loop over primitive induction variable.
  */
 internal class ForLoopsLowering(val context: Context) : FileLoweringPass {
@@ -49,7 +39,6 @@ internal class ForLoopsLowering(val context: Context) : FileLoweringPass {
 
     // TODO: reduce scope to IrBlock(origin=FOR_LOOP)
     override fun lower(irFile: IrFile) {
-//        irFile.transformChildrenVoid(forLoopTransformer)
 
         val transformer = RangeLoopTransformer(context, progressionInfoBuilder)
         // Lower loops
@@ -84,7 +73,7 @@ internal class ProgressionLoopInfo(
         loopVariable: IrVariable? = null
 ) : ForLoopInfo(progressionInfo, inductionVariable, bound, last, step, loopVariable)
 
-internal class CollectionLoopInfo(
+internal class ArrayLoopInfo(
         progressionInfo: ProgressionInfo,
         inductionVariable: IrVariable,
         bound: IrVariable,
@@ -102,12 +91,13 @@ private fun ProgressionType.elementType(context: Context): IrType = when (this) 
 private class RangeLoopTransformer(val context: Context, val progressionInfoBuilder: ProgressionInfoBuilder) : IrElementTransformerVoidWithContext() {
 
     private val symbols = context.ir.symbols
-    // TODO: map variable itself, not symbol.
     private val iteratorToLoopInfo = mutableMapOf<IrVariableSymbol, ForLoopInfo>()
     internal val oldLoopToNewLoop = mutableMapOf<IrLoop, IrLoop>()
 
-    fun scopeOwnerSymbol() =
-            currentScope!!.scope.scopeOwnerSymbol
+    private val progressionElementClasses = (symbols.integerClasses + symbols.char).toSet()
+
+    val scopeOwnerSymbol
+        get() = currentScope!!.scope.scopeOwnerSymbol
 
     private fun DeclarationIrBuilder.buildMinValueCondition(forLoopInfo: ForLoopInfo): IrExpression {
         // Condition for a corner case: for (i in a until Int.MIN_VALUE) {}.
@@ -143,7 +133,7 @@ private class RangeLoopTransformer(val context: Context, val progressionInfoBuil
             // TODO: Consider behavior unification?
             when (forLoopInfo) {
                 is ProgressionLoopInfo -> builtIns.lessOrEqualFunByOperandType[builtIns.int]?.symbol
-                is CollectionLoopInfo -> builtIns.lessFunByOperandType[builtIns.int]?.symbol
+                is ArrayLoopInfo -> builtIns.lessFunByOperandType[builtIns.int]?.symbol
             }
         }
         else builtIns.greaterOrEqualFunByOperandType[builtIns.int]?.symbol
@@ -216,7 +206,7 @@ private class RangeLoopTransformer(val context: Context, val progressionInfoBuil
             return super.visitWhileLoop(loop)
         }
 
-        with(context.createIrBuilder(scopeOwnerSymbol(), loop.startOffset, loop.endOffset)) {
+        with(context.createIrBuilder(scopeOwnerSymbol, loop.startOffset, loop.endOffset)) {
             // Transform accesses to the old iterator (see visitVariable method). Store loopVariable in loopInfo.
             // Replace not transparent containers with transparent ones (IrComposite)
             val newBody = loop.body?.transform(this@RangeLoopTransformer, null)?.let {
@@ -240,8 +230,6 @@ private class RangeLoopTransformer(val context: Context, val progressionInfoBuil
         }
     }
 
-    private val progressionElementClasses = (symbols.integerClasses + symbols.char).toSet()
-
     fun processHeader(variable: IrVariable): IrStatement? {
 
         assert(variable.origin == IrDeclarationOrigin.FOR_LOOP_ITERATOR)
@@ -253,7 +241,7 @@ private class RangeLoopTransformer(val context: Context, val progressionInfoBuil
         }
         assert(symbol !in iteratorToLoopInfo)
 
-        val builder = context.createIrBuilder(scopeOwnerSymbol(), variable.startOffset, variable.endOffset)
+        val builder = context.createIrBuilder(scopeOwnerSymbol, variable.startOffset, variable.endOffset)
         // Collect loop info and form the loop header composite.
         val progressionInfo = variable.accept(progressionInfoBuilder, null)
                 ?: return null
@@ -269,9 +257,11 @@ private class RangeLoopTransformer(val context: Context, val progressionInfoBuil
 
                 val statements = mutableListOf<IrStatement>()
 
-                progressionInfo.collectionReference?.let { collection ->
-                    collection.parent = variable.parent
-                    statements += collection
+                progressionInfo.arrayDeclaration?.let { collection ->
+                    if (isNewValueDeclaration) {
+                        collection.parent = variable.parent
+                        statements += collection
+                    }
                 }
 
                 // Due to features of PSI2IR we can obtain nullable arguments here while actually
@@ -327,14 +317,14 @@ private class RangeLoopTransformer(val context: Context, val progressionInfoBuil
                     statements.add(it)
                 }
 
-                iteratorToLoopInfo[symbol] = if (collectionReference != null) {
-                    CollectionLoopInfo(
+                iteratorToLoopInfo[symbol] = if (arrayDeclaration != null) {
+                    ArrayLoopInfo(
                             progressionInfo,
                             inductionVariable,
                             boundValue,
                             lastValue,
                             stepValue,
-                            collection = collectionReference)
+                            collection = arrayDeclaration)
                 } else {
                     ProgressionLoopInfo(
                             progressionInfo,
@@ -405,7 +395,7 @@ private class RangeLoopTransformer(val context: Context, val progressionInfoBuil
     }
 
     private fun getIterator(initializer: IrCall): IrGetValue =
-            if (initializer.symbol in symbols.arraysGets.values) {
+            if (initializer.symbol in symbols.arrayGet.values) {
                 (initializer.getValueArgument(0) as? IrCall)?.dispatchReceiver
             } else {
                 initializer.dispatchReceiver
@@ -429,17 +419,17 @@ private class RangeLoopTransformer(val context: Context, val progressionInfoBuil
             forLoopInfo.loopVariable = variable
         }
 
-        with(context.createIrBuilder(scopeOwnerSymbol(), initializer.startOffset, initializer.endOffset)) {
-            when (forLoopInfo) {
-                is CollectionLoopInfo -> {
-                    val collectionDeclaration: IrValueDeclaration = forLoopInfo.collection
-                    val callee = symbols.arraysGets[collectionDeclaration.type.classifierOrFail]!!
-                    variable.initializer = irCall(callee).apply {
+        with(context.createIrBuilder(scopeOwnerSymbol, initializer.startOffset, initializer.endOffset)) {
+            variable.initializer = when (forLoopInfo) {
+                is ArrayLoopInfo -> {
+                    val collectionDeclaration = forLoopInfo.collection
+                    val callee = symbols.arrayGet[collectionDeclaration.type.classifierOrFail]!!
+                    irCall(callee).apply {
                         dispatchReceiver = irGet(collectionDeclaration)
                         putValueArgument(0, irGet(forLoopInfo.inductionVariable))
                     }
                 }
-                else -> variable.initializer = irGet(forLoopInfo.inductionVariable)
+                is ProgressionLoopInfo -> irGet(forLoopInfo.inductionVariable)
             }
             val increment = irSetVar(forLoopInfo.inductionVariable, irCallOp(plusOperator.owner,
                     irGet(forLoopInfo.inductionVariable),

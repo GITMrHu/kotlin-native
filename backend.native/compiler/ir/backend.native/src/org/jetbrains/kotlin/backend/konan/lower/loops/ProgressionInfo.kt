@@ -19,7 +19,8 @@ enum class ProgressionType(val numberCastFunctionName: Name) {
     CHAR_PROGRESSION(Name.identifier("toChar"));
 }
 
-internal data class ProgressionInfo(
+// TODO: class became to complex, better be refactored.
+internal class ProgressionInfo(
         val progressionType: ProgressionType,
         val first: IrExpression,
         val bound: IrExpression,
@@ -27,7 +28,8 @@ internal data class ProgressionInfo(
         val increasing: Boolean = true,
         var needLastCalculation: Boolean = false,
         val closed: Boolean = true,
-        val collectionReference: IrValueDeclaration? = null)
+        val arrayDeclaration: IrValueDeclaration? = null,
+        val isNewValueDeclaration: Boolean = false)
 
 internal interface ProgressionHandler {
     val matcher: IrCallMatcher
@@ -72,11 +74,11 @@ internal class ProgressionInfoBuilder(val context: Context) : IrElementVisitor<P
 
     override fun visitCall(expression: IrCall, data: Nothing?): ProgressionInfo? {
         val progressionType = expression.type.getProgressionType()
-
         // TODO: Simplify or document
         return if (progressionType != null) {
             progressionHandlers.firstNotNullResult { it.handle(expression, progressionType) }
         } else {
+            // We will iterate over indices, so we use `ProgressionType.INT_PROGRESSION` here.
             arrayIterationHandler.handle(expression, ProgressionType.INT_PROGRESSION)
                     ?: expression.dispatchReceiver?.accept(this, null)
         }

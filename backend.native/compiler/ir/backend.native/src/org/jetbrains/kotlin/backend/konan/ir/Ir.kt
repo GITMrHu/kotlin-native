@@ -316,16 +316,15 @@ internal class KonanSymbols(context: Context, val symbolTable: SymbolTable, val 
         symbol.descriptor to symbolTable.referenceSimpleFunction(functionDescriptor)
     }.toMap()
 
-    val arrayGet = array.descriptor.unsubstitutedMemberScope
-            .getContributedFunctions(Name.identifier("get"), NoLookupLocation.FROM_BACKEND)
-            .single().let { symbolTable.referenceSimpleFunction(it) }
+    // TODO: is it okay to use arrayList here?
+    val arrayGet = (arrays + arrayList).associateBy(
+            { it },
+            { it.descriptor.unsubstitutedMemberScope
+                    .getContributedFunctions(Name.identifier("get"), NoLookupLocation.FROM_BACKEND)
+                    .single().let { symbolTable.referenceSimpleFunction(it) } }
+    )
 
-    val arraySet = array.descriptor.unsubstitutedMemberScope
-            .getContributedFunctions(Name.identifier("set"), NoLookupLocation.FROM_BACKEND)
-            .single().let { symbolTable.referenceSimpleFunction(it) }
-
-    // TODO: Unify with [arrayGet]
-    val arraysGets = (arrays + arrayList).associateBy(
+    val arraySet = (arrays + arrayList).associateBy(
             { it },
             { it.descriptor.unsubstitutedMemberScope
                     .getContributedFunctions(Name.identifier("get"), NoLookupLocation.FROM_BACKEND)

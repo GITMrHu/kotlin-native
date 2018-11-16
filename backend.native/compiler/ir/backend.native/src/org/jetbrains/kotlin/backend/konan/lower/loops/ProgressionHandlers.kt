@@ -1,6 +1,5 @@
 package org.jetbrains.kotlin.backend.konan.lower.loops
 
-import org.jetbrains.kotlin.backend.common.descriptors.WrappedVariableDescriptor
 import org.jetbrains.kotlin.backend.common.lower.createIrBuilder
 import org.jetbrains.kotlin.backend.konan.Context
 import org.jetbrains.kotlin.backend.konan.ir.KonanSymbols
@@ -10,14 +9,11 @@ import org.jetbrains.kotlin.backend.konan.lower.matchers.createIrCallMatcher
 import org.jetbrains.kotlin.backend.konan.lower.matchers.singleArgumentExtension
 import org.jetbrains.kotlin.ir.builders.irCall
 import org.jetbrains.kotlin.ir.builders.irGet
-import org.jetbrains.kotlin.ir.declarations.IrDeclarationOrigin
 import org.jetbrains.kotlin.ir.declarations.IrValueDeclaration
-import org.jetbrains.kotlin.ir.declarations.impl.IrVariableImpl
 import org.jetbrains.kotlin.ir.expressions.*
 import org.jetbrains.kotlin.ir.expressions.impl.IrCallImpl
 import org.jetbrains.kotlin.ir.expressions.impl.IrConstImpl
 import org.jetbrains.kotlin.ir.symbols.IrClassSymbol
-import org.jetbrains.kotlin.ir.symbols.impl.IrVariableSymbolImpl
 import org.jetbrains.kotlin.ir.types.*
 import org.jetbrains.kotlin.ir.visitors.IrElementVisitor
 import org.jetbrains.kotlin.name.FqName
@@ -65,7 +61,7 @@ internal class IndicesHandler(val context: Context) : ProgressionHandler {
 
     private val symbols = context.ir.symbols
 
-    private val supportedArrays = symbols.primitiveArrays.values + symbols.array + symbols.string
+    private val supportedArrays = symbols.primitiveArrays.values + symbols.array
 
     override val matcher = createIrCallMatcher {
         callee {
@@ -152,52 +148,46 @@ internal class StepHandler(context: Context, val visitor: IrElementVisitor<Progr
             }
 }
 
-
-
 internal class ArrayIterationHandler(val context: Context) : ProgressionHandler {
 
     private val symbols = context.ir.symbols
 
-    private val supportedArrays = symbols.primitiveArrays.values + symbols.array + symbols.string + symbols.arrayList
+    private val supportedArrays = symbols.primitiveArrays.values + symbols.array + symbols.arrayList
 
+    // Check that it is a call to .iterator() method.
+    // No support for rare cases like `T : IntArray` for now.
     override val matcher = createIrCallMatcher {
         origin { it == IrStatementOrigin.FOR_LOOP_ITERATOR }
-        dispatchReceiver { it != null && it.type.classifierOrNull in supportedArrays }
+        dispatchReceiver { it != null && (it.type.classifierOrNull in supportedArrays) }
     }
 
-    // Consider case like
-    // `for (elem in getArray()) { ... }`
-    // TODO: complete comment
-    //
-    private fun createArrayReference(collectionProducer: IrCall): IrValueDeclaration {
-        val wrappedVariableDescriptor = WrappedVariableDescriptor()
-        return IrVariableImpl(
-                collectionProducer.startOffset,
-                collectionProducer.endOffset,
-                IrDeclarationOrigin.IR_TEMPORARY_VARIABLE,
-                IrVariableSymbolImpl(wrappedVariableDescriptor),
-                // TODO: better identifier
-                Name.identifier("TODO()_collection"),
-                collectionProducer.dispatchReceiver!!.type,
-                false,
-                false,
-                false).apply {
-            initializer = collectionProducer.dispatchReceiver
-            wrappedVariableDescriptor.bind(this)
-        }
-    }
+    // Consider case like `for (elem in A) { f(elem) }`
+    // If we lower it to `for (i in A.indices) { f(A[i]) }`
+    // Then we will break program behaviour if A is an expression with side-effect.
+    // Instead, we lower it to
+    // ```
+    // val a = A
+    // for (i in a.indices) { f(a[i]) }
+    // ```
+    private fun shouldCreateTemporaryVariable(collectionProducer: IrCall) =
+            collectionProducer.dispatchReceiver !is IrValueDeclaration
 
-    override fun build(call: IrCall, progressionType: ProgressionType): ProgressionInfo? {
-        // TODO: create only if there is need for separate reference.
-        val collectionReference = createArrayReference(call)
-        val int0 = IrConstImpl.int(call.startOffset, call.endOffset, context.irBuiltIns.intType, 0)
-        val bound = with(context.createIrBuilder(call.symbol, call.startOffset, call.endOffset)) {
+    override fun build(call: IrCall, progressionType: ProgressionType): ProgressionInfo? =
+        with(context.createIrBuilder(call.symbol, call.startOffset, call.endOffset)) {
+            val int0 = IrConstImpl.int(call.startOffset, call.endOffset, context.irBuiltIns.intType, 0)
+            val (collectionReference, isNewDeclaration) = if (shouldCreateTemporaryVariable(call)) {
+                scope.createTemporaryVariable(call.dispatchReceiver!!) to true
+            } else {
+                call.dispatchReceiver as IrValueDeclaration to false
+            }
+
             val clazz = collectionReference.type.classifierOrFail
             val arraySizeSymbol = symbols.arraySize[clazz]!!
-            irCall(arraySizeSymbol).apply {
+            val bound = irCall(arraySizeSymbol).apply {
                 dispatchReceiver = irGet(collectionReference)
             }
+            ProgressionInfo(progressionType, int0, bound,
+                    arrayDeclaration = collectionReference,
+                    isNewValueDeclaration = isNewDeclaration)
         }
-        return ProgressionInfo(progressionType, int0, bound, collectionReference = collectionReference)
-    }
 }
