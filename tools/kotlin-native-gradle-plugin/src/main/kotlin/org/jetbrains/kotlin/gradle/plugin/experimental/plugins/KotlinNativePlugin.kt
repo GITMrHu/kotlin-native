@@ -16,11 +16,17 @@
 
 package org.jetbrains.kotlin.gradle.plugin.experimental.plugins
 
+import org.gradle.api.Named
 import org.gradle.api.Plugin
 import org.gradle.api.Project
+import org.gradle.api.artifacts.*
+import org.gradle.api.attributes.AttributeContainer
 import org.gradle.api.attributes.Usage
+import org.gradle.api.capabilities.Capability
 import org.gradle.api.internal.FactoryNamedDomainObjectContainer
 import org.gradle.api.internal.attributes.ImmutableAttributesFactory
+import org.gradle.api.internal.component.SoftwareComponentInternal
+import org.gradle.api.internal.component.UsageContext
 import org.gradle.api.internal.project.ProjectInternal
 import org.gradle.api.model.ObjectFactory
 import org.gradle.api.provider.Provider
@@ -32,12 +38,14 @@ import org.gradle.language.cpp.CppBinary.DEBUGGABLE_ATTRIBUTE
 import org.gradle.language.cpp.CppBinary.OPTIMIZED_ATTRIBUTE
 import org.gradle.language.cpp.internal.DefaultUsageContext
 import org.gradle.nativeplatform.test.plugins.NativeTestingBasePlugin
+import org.jetbrains.kotlin.gradle.plugin.EXPECTED_BY_CONFIG_NAME
 import org.jetbrains.kotlin.gradle.plugin.KotlinPlatformType
 import org.jetbrains.kotlin.gradle.plugin.experimental.KotlinNativeBinary.Companion.KONAN_TARGET_ATTRIBUTE
 import org.jetbrains.kotlin.gradle.plugin.experimental.internal.*
 import org.jetbrains.kotlin.gradle.plugin.experimental.internal.OutputKind.Companion.getDevelopmentKind
 import org.jetbrains.kotlin.gradle.plugin.experimental.sourcesets.KotlinNativeSourceSetFactory
 import org.jetbrains.kotlin.gradle.plugin.experimental.sourcesets.KotlinNativeSourceSetImpl
+import org.jetbrains.kotlin.gradle.plugin.mpp.KotlinUsages
 import org.jetbrains.kotlin.konan.target.HostManager
 import org.jetbrains.kotlin.konan.target.KonanTarget
 import javax.inject.Inject
